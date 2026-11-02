@@ -1,4 +1,5 @@
 use super::*;
+use super::super::native_device::COMPATIBILITY_UA;
 
 #[test]
 fn test_feed_cleaning_preserves_private_visibility() {
@@ -17,11 +18,12 @@ fn test_feed_cleaning_preserves_private_visibility() {
 #[test]
 fn test_publish_device_model_is_scoped_and_preserves_identity() {
     let client = CoolapkClient::new();
+    // 自定义指纹 UA 必须是 Dalvik 式才能通过网关（见 gateway_safe_user_agent）。
     client.update_device_profile(DeviceProfile {
         device_id: Some("publish-identity".into()),
         manufacturer: Some("Apple".into()), brand: Some("Apple".into()),
         model: Some("iPhone17,3".into()), build: Some("real-build".into()),
-        user_agent: Some("native-UA iPhone17,3".into()),
+        user_agent: Some("Dalvik/2.1.0 (Linux; U; Android 15; custom-device Build/custom-build) (#Build; Xiaomi; custom-device; custom-build; 15) +CoolMarket/16.2.0-2604201-universal".into()),
         ..Default::default()
     });
     let original_code = client.device_code.read().unwrap().clone();
@@ -40,9 +42,11 @@ fn test_publish_device_model_is_scoped_and_preserves_identity() {
     assert_eq!(hidden_fields[0], "publish-identity");
     assert!(hidden_fields[4..8].iter().all(String::is_empty));
     assert_eq!(visible_fields[6], "iPhone17,3");
-    assert_eq!(hidden.headers()[USER_AGENT], "CoolMarket/16.2.0-2604201-universal");
+    // 网关只放行 Dalvik 式 UA：隐藏机型时用无机型的通用 Dalvik UA，
+    // Dalvik 式自定义 UA 按用户指纹透传（default_headers 于发送时才合并，build 不可见）。
+    assert_eq!(hidden.headers()[USER_AGENT], "Dalvik/2.1.0 (Linux; U; Android 16) +CoolMarket/16.2.0-2604201-universal");
     assert_eq!(hidden.headers().get_all(USER_AGENT).iter().count(), 1);
-    assert_eq!(visible.headers()[USER_AGENT], "native-UA iPhone17,3");
+    assert_eq!(visible.headers()[USER_AGENT], "Dalvik/2.1.0 (Linux; U; Android 15; custom-device Build/custom-build) (#Build; Xiaomi; custom-device; custom-build; 15) +CoolMarket/16.2.0-2604201-universal");
     assert_eq!(hidden.body().unwrap().as_bytes(), visible.body().unwrap().as_bytes());
     assert_eq!(*client.device_code.read().unwrap(), original_code);
     assert!(device_code_without_model("invalid").is_err());
@@ -1703,10 +1707,12 @@ fn test_native_device_profile_survives_settings_sync_and_custom_reset() {
         model: Some("iPhone17,3".into()), build: Some("22A3354".into()),
         user_agent: Some(native_ua.into()), ..Default::default()
     };
-    let verify = |expected_ua: &str, expected_model_fields: &str| {
+    let verify = |expected_ua: Option<&str>, expected_model_fields: &str| {
         let request = client.apply_device_profile(client.api_client().unwrap().post("https://api.coolapk.com/v6/feed/createFeed"))
             .unwrap().build().unwrap();
-        assert_eq!(request.headers().get(USER_AGENT).unwrap().to_str().unwrap(), expected_ua);
+        // default_headers 在发送时才合并：请求级 UA 为 None 表示回落到客户端默认
+        // COMPATIBILITY_UA（Dalvik 式），由 build_api_clients 的网关卡点保证。
+        assert_eq!(request.headers().get(USER_AGENT).map(|value| value.to_str().unwrap()), expected_ua);
         let code = request.headers().get("X-App-Device").unwrap().to_str().unwrap();
         let mut encoded: String = code.chars().rev().collect();
         while encoded.len() % 4 != 0 { encoded.push('='); }
@@ -1716,14 +1722,40 @@ fn test_native_device_profile_survives_settings_sync_and_custom_reset() {
     };
     // 前端关闭自定义时仍发送保存的设备 ID，不能抹掉本机信息。
     client.update_device_profile(DeviceProfile { device_id: Some("saved-device-id".into()), ..Default::default() });
-    verify(native_ua, "; Apple; Apple; iPhone17,3; 22A3354;");
+    // Mozilla 式原生 UA 被网关卡点拦截，请求级不覆盖 UA，发送时使用默认 Dalvik UA。
+    verify(None, "; Apple; Apple; iPhone17,3; 22A3354;");
     assert_eq!(client.get_device_info().unwrap()["data"]["defaultProfile"]["source"], "native");
     client.update_device_profile(DeviceProfile {
         device_id: Some("saved-device-id".into()), manufacturer: Some("Xiaomi".into()), brand: Some("Redmi".into()),
         model: Some("24117RK2CC".into()), build: Some("custom-build".into()),
         user_agent: Some("custom-user-agent".into()), ..Default::default()
     });
-    verify("custom-user-agent", "; Xiaomi; Redmi; 24117RK2CC; custom-build;");
+    // 非 Dalvik 式自定义 UA 同样回落（机型字段仍随 X-App-Device 编码发送）。
+    verify(None, "; Xiaomi; Redmi; 24117RK2CC; custom-build;");
+    client.update_device_profile(DeviceProfile {
+        device_id: Some("saved-device-id".into()), manufacturer: Some("Xiaomi".into()), brand: Some("Redmi".into()),
+        model: Some("24117RK2CC".into()), build: Some("custom-build".into()),
+        user_agent: Some("Dalvik/2.1.0 (Linux; U; Android 15; 24117RK2CC Build/custom-build) (#Build; Redmi; 24117RK2CC; custom-build; 15) +CoolMarket/16.2.0-2604201-universal".into()),
+        ..Default::default()
+    });
+    // Dalvik 式自定义 UA 按用户指纹透传。
+    verify(Some("Dalvik/2.1.0 (Linux; U; Android 15; 24117RK2CC Build/custom-build) (#Build; Redmi; 24117RK2CC; custom-build; 15) +CoolMarket/16.2.0-2604201-universal"), "; Xiaomi; Redmi; 24117RK2CC; custom-build;");
     client.update_device_profile(DeviceProfile { device_id: Some("saved-device-id".into()), ..Default::default() });
-    verify(native_ua, "; Apple; Apple; iPhone17,3; 22A3354;");
+    verify(None, "; Apple; Apple; iPhone17,3; 22A3354;");
+}
+
+#[test]
+fn test_gateway_safe_user_agent_only_allows_dalvik_style() {
+    // Dalvik 式 UA 原样放行（实测网关 200）。
+    assert_eq!(
+        gateway_safe_user_agent(Some("Dalvik/2.1.0 (Linux; U; Android 16) +CoolMarket/16.2.0-2604201-universal")).map(|value| value.to_str().unwrap().to_string()),
+        Some("Dalvik/2.1.0 (Linux; U; Android 16) +CoolMarket/16.2.0-2604201-universal".to_string())
+    );
+    // 浏览器式 UA 被网关裸 403 拒绝（实测），必须回落。
+    assert_eq!(gateway_safe_user_agent(Some("Mozilla/5.0 (Macintosh; Mac OS X 15_0) AppleWebKit/605.1.15 +CoolMarket/16.2.0-2604201-universal")), None);
+    // 裸 CoolMarket UA 同样被网关拒绝（实测 403）。
+    assert_eq!(gateway_safe_user_agent(Some("CoolMarket/16.2.0-2604201-universal")), None);
+    // 空/缺失 UA 回落。
+    assert_eq!(gateway_safe_user_agent(Some("  ")), None);
+    assert_eq!(gateway_safe_user_agent(None), None);
 }

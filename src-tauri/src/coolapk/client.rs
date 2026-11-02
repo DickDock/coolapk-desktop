@@ -1039,9 +1039,22 @@ pub(crate) fn base_http_client_builder() -> reqwest::ClientBuilder {
     builder
 }
 
+/// 网关侧 UA 白名单：酷安 API 网关（TencentEdgeOne）只放行 `Dalvik/` 前缀的安卓客户端 UA，
+/// 浏览器式 UA（Mozilla/5.0 ...）一律被 CDN 以裸 403（空响应体）拒绝。
+/// 2026-11 实测：同一请求头与 token，Dalvik UA=200，Mozilla UA=403，
+/// 而 Apple 平台的设备画像此前生成的是 Mozilla 式 UA，导致 macOS/iOS 全接口被拦、登录失败。
+/// 因此这里只放行 Dalvik 形态；其余（含用户自定义 UA）返回 None，由调用方回落到 COMPATIBILITY_UA。
+fn gateway_safe_user_agent(ua: Option<&str>) -> Option<HeaderValue> {
+    let ua = ua?.trim();
+    if ua.is_empty() || !ua.starts_with("Dalvik/") {
+        return None;
+    }
+    HeaderValue::from_str(ua).ok()
+}
+
 fn build_api_clients(profile: &DeviceProfile) -> Result<(Client, Client), String> {
     let mut headers = HeaderMap::new();
-    headers.insert(USER_AGENT, profile.user_agent.as_deref().and_then(|value| HeaderValue::from_str(value).ok()).unwrap_or_else(|| HeaderValue::from_static(super::native_device::COMPATIBILITY_UA)));
+    headers.insert(USER_AGENT, gateway_safe_user_agent(profile.user_agent.as_deref()).unwrap_or_else(|| HeaderValue::from_static(super::native_device::COMPATIBILITY_UA)));
     headers.insert("X-Sdk-Int", profile.sdk_int.as_deref().and_then(|value| HeaderValue::from_str(value).ok()).unwrap_or_else(|| HeaderValue::from_static("36")));
     headers.insert("X-Sdk-Locale", HeaderValue::from_static("zh-CN"));
     headers.insert("X-App-Mode", HeaderValue::from_static("universal"));
@@ -1274,11 +1287,11 @@ impl CoolapkClient {
                 request = request.header("X-App-Supported", header_value);
             }
         }
-        if let Some(ua) = profile.user_agent.as_ref().filter(|s| !s.trim().is_empty()) {
-            if let Ok(header_value) = HeaderValue::from_str(ua) {
-                request = request.header(USER_AGENT, header_value);
-            }
+        if let Some(header_value) = gateway_safe_user_agent(profile.user_agent.as_deref()) {
+            request = request.header(USER_AGENT, header_value);
         }
+        // 非 Dalvik 式 UA（浏览器式/用户误填）不覆盖请求头，
+        // 保持 default_headers 中已回落的 COMPATIBILITY_UA，避免全接口被网关 403。
         Ok(request)
     }
 
@@ -7061,8 +7074,10 @@ impl CoolapkClient {
         if include_device_model { return Ok(request); }
         let profile = self.effective_device_profile();
         // 覆盖默认 UA 和自定义 UA，避免从 #Build 或 Dalvik 片段重新识别机型。
+        // 网关只放行 Dalvik 式 UA（见 gateway_safe_user_agent），因此隐藏机型时
+        // 使用不含机型/Build 的通用 Dalvik UA，而非裸 CoolMarket UA（会被 403）。
         let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_str(&format!("CoolMarket/{}-{}-universal",
+        headers.insert(USER_AGENT, HeaderValue::from_str(&format!("Dalvik/2.1.0 (Linux; U; Android 16) +CoolMarket/{}-{}-universal",
             profile.app_version.as_deref().unwrap_or("16.2.0"),
             profile.app_code.as_deref().unwrap_or("2604201"))).map_err(|_| "发布 UA 格式无效")?);
         Ok(request.headers(headers))
