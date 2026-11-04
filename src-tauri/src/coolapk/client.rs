@@ -1,6 +1,7 @@
 use super::http_session::{session, Policy as SessionPolicy};
 use crate::coolapk::auth::CoolapkAuth;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, LOCATION, USER_AGENT};
 use reqwest::{Client, Method};
 use serde_json::{Value, json};
@@ -240,6 +241,16 @@ pub fn classify_path(path: &str) -> PathRequirements {
     }
 }
 
+/// 易盾凭证进入 Cookie 时按 RFC6265 做 percent-encoding（`:→%3A` 等）。
+fn encode_cookie_value(value: &str) -> String {
+    const COOKIE_VALUE_SET: &percent_encoding::AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    utf8_percent_encode(value, COOKIE_VALUE_SET).to_string()
+}
+
 pub struct CoolapkClient {
     client: RwLock<Client>,
     /// Live Photo 解析只需要拿到重定向地址，不能跟随重定向把视频正文提前下载掉。
@@ -247,6 +258,10 @@ pub struct CoolapkClient {
     auth: RwLock<CoolapkAuth>,
     user_cookie: RwLock<Option<String>>,
     cookie_file: RwLock<Option<PathBuf>>,
+    /// 网易易盾验证凭证（`NEC:{id8}:{validate}`）：captchaField 为空的挑战要求把凭证
+    /// 作为 `validate` Cookie 携带（c001apk CaptchaRetryTest 的 wire 约定），设置后
+    /// 附加到后续所有酷安 API 请求，直到新的验证替换它。
+    validate_cookie: RwLock<Option<String>>,
     device_profile: RwLock<DeviceProfile>,
     native_device_profile: DeviceProfile,
     device_code: RwLock<String>,
@@ -1100,6 +1115,7 @@ impl CoolapkClient {
             auth: RwLock::new(CoolapkAuth::new(device_code.clone())),
             user_cookie: RwLock::new(None),
             cookie_file: RwLock::new(None),
+            validate_cookie: RwLock::new(None),
             device_profile: RwLock::new(DeviceProfile::default()),
             native_device_profile,
             device_code: RwLock::new(device_code),
@@ -1783,7 +1799,10 @@ impl CoolapkClient {
             .clone();
         let mut cookie_attached = false;
         if let Some(cookie) = cookie {
-            let full_cookie = self.cookie_for_path(&cookie, path);
+            let mut full_cookie = self.cookie_for_path(&cookie, path);
+            if let Some(validate) = self.validate_cookie_header() {
+                full_cookie.push_str(&validate);
+            }
             if let Ok(header_val) = reqwest::header::HeaderValue::from_str(&full_cookie) {
                 request = request.header(COOKIE, header_val);
                 cookie_attached = true;
@@ -1858,14 +1877,21 @@ impl CoolapkClient {
         let public_token = CoolapkAuth::new(public_device_code.clone()).get_app_token()?;
         let device_header = HeaderValue::from_str(&public_device_code)
             .map_err(|_| "公开读取设备码格式无效".to_string())?;
-        log::debug!("api.guest_request path={} cookie_attached=false", log_path);
-        let response = self
+        let mut guest_request = self
             .api_client()?
             .get(format!("{api_origin}{path}"))
             .header("X-App-Token", public_token)
             .header("X-App-Device", device_header)
             .header("X-Requested-With", "XMLHttpRequest")
-            .query(query)
+            .query(query);
+        // 游客请求不携带账号 Cookie，但易盾验证凭证同样适用于游客读取。
+        if let Some(validate) = self.validate_cookie_header() {
+            if let Ok(header_val) = HeaderValue::from_str(validate.trim_start_matches(';')) {
+                guest_request = guest_request.header(COOKIE, header_val);
+            }
+        }
+        log::debug!("api.guest_request path={} cookie_attached=false", log_path);
+        let response = guest_request
             .send()
             .await
             .map_err(|error| {
@@ -3987,12 +4013,39 @@ impl CoolapkClient {
         Ok(json!({ "code": 200, "data": value }))
     }
 
+    /// 返回可拼接到 Cookie 头的 `; validate=...` 片段（无凭证时为 None）。
+    fn validate_cookie_header(&self) -> Option<String> {
+        let validate = self
+            .validate_cookie
+            .read()
+            .ok()?
+            .clone()
+            .filter(|value| !value.is_empty())?;
+        Some(format!("; validate={}", encode_cookie_value(&validate)))
+    }
+
+    /// 记录易盾验证凭证，供后续请求以 validate Cookie 携带。
+    fn store_validate_cookie(&self, token: &str) {
+        log::info!("captcha.validate_cookie_set len={}", token.len());
+        if let Ok(mut slot) = self.validate_cookie.write() {
+            *slot = Some(token.to_string());
+        }
+    }
+
     pub async fn get_feed_detail(&self, feed_id: &str, post_token: Option<&str>, post_token_field: Option<&str>) -> Result<Value, String> {
         let mut query = vec![("id", feed_id.to_string())];
-        if let Some(token) = post_token.filter(|value| !value.trim().is_empty()) {
-            // 验证令牌使用服务端指定的安全字段名，缺省时使用酷安标准字段。
-            let field = post_token_field.filter(|value| value.starts_with('_') && value.len() <= 64 && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')).unwrap_or("_v2_post_token");
-            query.push((field, token.to_string()));
+        let token = post_token.map(str::trim).filter(|value| !value.is_empty());
+        // 服务端 messageExtra 里 captchaField 显式为空表示 validate-cookie 协议：
+        // 凭证作为 validate Cookie 携带，而不是查询参数（见 c001apk CaptchaRetryTest）。
+        let blank_field = matches!(post_token_field, Some(field) if field.trim().is_empty());
+        if let Some(token) = token {
+            if blank_field {
+                self.store_validate_cookie(token);
+            } else {
+                // 验证令牌使用服务端指定的安全字段名，缺省时使用酷安标准字段。
+                let field = post_token_field.filter(|value| value.starts_with('_') && value.len() <= 64 && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')).unwrap_or("_v2_post_token");
+                query.push((field, token.to_string()));
+            }
         }
         let primary_error = match self.api_get("/v6/feed/detail", &query).await {
             Ok(value) if matches!(application_failure(&value), Some((403, "captcha"))) => return Err(value.to_string()),

@@ -225,6 +225,10 @@ export function installDiagnosticLogging(): void {
   window.addEventListener('error', event => {
     const target = event.target;
     if (!(target instanceof HTMLElement) || !['IMG', 'VIDEO', 'AUDIO', 'SCRIPT', 'LINK'].includes(target.tagName)) return;
-    logDiagnosticLimited('warn', 'resource', 'load_failed', `element=${target.tagName.toLowerCase()}`, 5000, `resource:${target.tagName}`);
+    const url = (target as HTMLScriptElement).src
+      || (target as HTMLLinkElement).href
+      || (target as HTMLImageElement).currentSrc
+      || '';
+    logDiagnosticLimited('warn', 'resource', 'load_failed', `element=${target.tagName.toLowerCase()}${url ? ` url=${redactDiagnosticText(url)}` : ''}`, 5000, `resource:${target.tagName}`);
   }, true);
 }

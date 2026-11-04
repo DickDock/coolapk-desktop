@@ -24,6 +24,7 @@ tauri-plugin-store = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 semver = "1"
+percent-encoding = "2.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "gzip", "multipart", "rustls-tls", "stream", "socks"] }
 tokio = { version = "1.36", features = ["full"] }
 futures-util = "0.3"

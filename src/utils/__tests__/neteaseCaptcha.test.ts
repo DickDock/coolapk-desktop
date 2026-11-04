@@ -27,6 +27,18 @@ describe('neteaseCaptcha', () => {
     expect(extractCaptchaParamsFromError(JSON.stringify({ code: 403, message: '无权访问' }))).toBeNull();
   });
 
+  it('captchaField 显式为空时保留空串（validate-cookie 协议），不被折叠成默认字段', () => {
+    const response = {
+      code: 403,
+      messageStatus: 'err_request_captcha_v2',
+      messageExtra: JSON.stringify({ message: '当前访问需要验证码', captchaType: 'NEC', captchaId: '5fc4c10eccd64d178982bc560da43a91', captchaField: '' }),
+    };
+    expect(extractCaptchaParamsFromError(JSON.stringify(response))).toEqual({
+      captchaId: '5fc4c10eccd64d178982bc560da43a91',
+      captchaField: '',
+    });
+  });
+
   it('loads the script tag into DOM', async () => {
     const promise = loadNECaptchaScript();
     const script = document.querySelector('script[src*="load.min.js"]');
